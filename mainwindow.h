@@ -93,7 +93,7 @@ private:
     // Данные
     QString m_currentCity;
     QStringList m_favoriteCities;
-    QString m_currentLanguage;  // Теперь храним код языка вместо bool
+    QString m_currentLanguage;
     bool m_isCelsius;
     QMap<QString, QPixmap> m_iconCache;
     QCompleter *m_completer;
