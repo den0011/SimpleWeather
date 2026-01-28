@@ -1,9 +1,11 @@
 #include "mainwindow.h"
 #include "ui_mainwindow.h"
+#include "translator.h"
 #include <QMessageBox>
 #include <QUrlQuery>
 #include <QPixmap>
 #include <QDateTime>
+#include <QDebug>
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -12,14 +14,34 @@ MainWindow::MainWindow(QWidget *parent)
     , m_settings(new QSettings(this))
     , m_refreshTimer(new QTimer(this))
     , m_searchDebounceTimer(new QTimer(this))
-    , m_isDarkTheme(false)
+    , m_currentLanguage("ru")
     , m_isCelsius(true)
     , m_completerModel(new QStringListModel(this))
+    , m_hasWeatherData(false)
 {
     ui->setupUi(this);
 
+    qDebug() << "=== MainWindow initialization ===";
+
+    // КРИТИЧЕСКИ ВАЖНО: загружаем язык ПЕРВЫМ делом, до любых UI операций
+    m_currentLanguage = m_settings->value("language", "ru").toString();
+    qDebug() << "Loading language:" << m_currentLanguage;
+
+    if (!Translator::instance().loadLanguage(m_currentLanguage)) {
+        qWarning() << "Failed to load language" << m_currentLanguage << ", trying 'ru'";
+        m_currentLanguage = "ru";
+        if (!Translator::instance().loadLanguage("ru")) {
+            qCritical() << "CRITICAL: Failed to load fallback language 'ru'!";
+            qCritical() << "Make sure 'lang' folder exists next to the executable!";
+        }
+    }
+
+    // Теперь загружаем остальные настройки
     loadSettings();
+
+    // Применяем тему и обновляем язык UI
     applyTheme();
+    updateLanguage();
     setupConnections();
 
     // Настройка автодополнения
@@ -64,8 +86,11 @@ MainWindow::MainWindow(QWidget *parent)
 
     // Автозагрузка последнего города
     if (!m_currentCity.isEmpty()) {
-        fetchWeather(m_currentCity);
-        fetchForecast(m_currentCity);
+        qDebug() << "Loading last city:" << m_currentCity;
+        QTimer::singleShot(100, this, [this]() {
+            fetchWeather(m_currentCity);
+            fetchForecast(m_currentCity);
+        });
     }
 }
 
@@ -80,7 +105,7 @@ void MainWindow::setupConnections()
     connect(ui->m_searchButton, &QPushButton::clicked, this, &MainWindow::searchCity);
     connect(ui->m_searchInput, &QLineEdit::returnPressed, this, &MainWindow::searchCity);
     connect(ui->m_favoriteButton, &QPushButton::clicked, this, &MainWindow::addToFavorites);
-    connect(ui->m_themeButton, &QPushButton::clicked, this, &MainWindow::toggleTheme);
+    connect(ui->m_languageButton, &QPushButton::clicked, this, &MainWindow::toggleLanguage);
     connect(ui->m_refreshButton, &QPushButton::clicked, this, &MainWindow::refreshCurrentCity);
     connect(ui->m_unitsCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &MainWindow::toggleUnits);
@@ -96,7 +121,7 @@ void MainWindow::searchCity()
 {
     QString city = ui->m_searchInput->text().trimmed();
     if (city.isEmpty()) {
-        QMessageBox::warning(this, "Ошибка", "Введите название города");
+        QMessageBox::warning(this, TR("Search/error_title"), TR("Search/error_empty"));
         return;
     }
 
@@ -104,7 +129,7 @@ void MainWindow::searchCity()
     QUrlQuery query;
     query.addQueryItem("name", city);
     query.addQueryItem("count", "1");
-    query.addQueryItem("language", "ru");
+    query.addQueryItem("language", getCurrentLanguageCode());
     query.addQueryItem("format", "json");
     url.setQuery(query);
 
@@ -116,6 +141,7 @@ void MainWindow::searchCity()
 
 void MainWindow::onSslErrors(QNetworkReply *reply, const QList<QSslError> &errors)
 {
+    Q_UNUSED(errors)
     reply->ignoreSslErrors();
 }
 
@@ -136,8 +162,8 @@ void MainWindow::onSearchFinished(QNetworkReply *reply)
     reply->deleteLater();
 
     if (reply->error() != QNetworkReply::NoError) {
-        QMessageBox::warning(this, "Ошибка сети",
-            "Не удалось найти город: " + reply->errorString());
+        QMessageBox::warning(this, TR("Search/network_error"),
+                           TR("Search/failed_to_find") + reply->errorString());
         return;
     }
 
@@ -147,7 +173,7 @@ void MainWindow::onSearchFinished(QNetworkReply *reply)
     QJsonArray results = obj["results"].toArray();
 
     if (results.isEmpty()) {
-        QMessageBox::warning(this, "Ошибка", "Город не найден. Попробуйте ввести название по-другому.");
+        QMessageBox::warning(this, TR("Search/error_title"), TR("Search/city_not_found"));
         return;
     }
 
@@ -162,6 +188,8 @@ void MainWindow::onSearchFinished(QNetworkReply *reply)
 
 void MainWindow::fetchWeather(const QString &city)
 {
+    qDebug() << "Fetching weather for:" << city;
+
     QStringList parts = city.split(", ");
     if (parts.isEmpty()) return;
 
@@ -169,8 +197,11 @@ void MainWindow::fetchWeather(const QString &city)
     QUrlQuery geoQuery;
     geoQuery.addQueryItem("name", parts[0]);
     geoQuery.addQueryItem("count", "1");
-    geoQuery.addQueryItem("language", "ru");
+    geoQuery.addQueryItem("language", getCurrentLanguageCode());
+    geoQuery.addQueryItem("format", "json");
     geoUrl.setQuery(geoQuery);
+
+    qDebug() << "Geocoding URL:" << geoUrl.toString();
 
     QNetworkRequest request = createRequest(geoUrl);
     QNetworkReply *geoReply = m_networkManager->get(request);
@@ -183,13 +214,19 @@ void MainWindow::fetchWeather(const QString &city)
             return;
         }
 
-        QJsonDocument doc = QJsonDocument::fromJson(geoReply->readAll());
-        QJsonArray results = doc.object()["results"].toArray();
+        QByteArray geoData = geoReply->readAll();
+        qDebug() << "Geocoding response:" << geoData;
+
+        QJsonDocument doc = QJsonDocument::fromJson(geoData);
+        QJsonObject obj = doc.object();
+        QJsonArray results = obj["results"].toArray();
 
         if (!results.isEmpty()) {
             QJsonObject location = results[0].toObject();
             double lat = location["latitude"].toDouble();
             double lon = location["longitude"].toDouble();
+
+            qDebug() << "Got coordinates:" << lat << lon;
 
             QUrl url(WEATHER_API_URL);
             QUrlQuery query;
@@ -201,6 +238,8 @@ void MainWindow::fetchWeather(const QString &city)
 
             QNetworkRequest weatherRequest = createRequest(url);
             m_networkManager->get(weatherRequest);
+        } else {
+            qDebug() << "No geocoding results found";
         }
     });
 }
@@ -210,12 +249,21 @@ void MainWindow::onWeatherFinished(QNetworkReply *reply)
     reply->deleteLater();
 
     if (reply->error() != QNetworkReply::NoError) {
+        qDebug() << "Weather error:" << reply->errorString();
         return;
     }
 
-    QJsonDocument doc = QJsonDocument::fromJson(reply->readAll());
+    QByteArray responseData = reply->readAll();
+    qDebug() << "Weather response received, size:" << responseData.size();
+
+    QJsonDocument doc = QJsonDocument::fromJson(responseData);
     QJsonObject obj = doc.object();
     QJsonObject current = obj["current"].toObject();
+
+    if (current.isEmpty()) {
+        qDebug() << "Current weather data is empty!";
+        return;
+    }
 
     WeatherData data;
     data.city = m_currentCity;
@@ -225,17 +273,21 @@ void MainWindow::onWeatherFinished(QNetworkReply *reply)
     data.windSpeed = current["wind_speed_10m"].toDouble();
 
     int weatherCode = current["weather_code"].toInt();
-    if (weatherCode == 0) data.description = "Ясно";
-    else if (weatherCode <= 3) data.description = "Облачно";
-    else if (weatherCode <= 67) data.description = "Дождь";
-    else if (weatherCode <= 77) data.description = "Снег";
-    else data.description = "Гроза";
+    data.weatherCode = weatherCode;
+    data.description = getWeatherDescription(weatherCode);
+
+    qDebug() << "Weather data:" << data.city << data.temp << data.description;
+
+    m_currentWeatherData = data;
+    m_hasWeatherData = true;
 
     displayWeather(data);
 }
 
 void MainWindow::fetchForecast(const QString &city)
 {
+    qDebug() << "Fetching forecast for:" << city;
+
     QStringList parts = city.split(", ");
     if (parts.isEmpty()) return;
 
@@ -243,7 +295,8 @@ void MainWindow::fetchForecast(const QString &city)
     QUrlQuery geoQuery;
     geoQuery.addQueryItem("name", parts[0]);
     geoQuery.addQueryItem("count", "1");
-    geoQuery.addQueryItem("language", "ru");
+    geoQuery.addQueryItem("language", getCurrentLanguageCode());
+    geoQuery.addQueryItem("format", "json");
     geoUrl.setQuery(geoQuery);
 
     QNetworkRequest request = createRequest(geoUrl);
@@ -257,13 +310,17 @@ void MainWindow::fetchForecast(const QString &city)
             return;
         }
 
-        QJsonDocument doc = QJsonDocument::fromJson(geoReply->readAll());
-        QJsonArray results = doc.object()["results"].toArray();
+        QByteArray geoData = geoReply->readAll();
+        QJsonDocument doc = QJsonDocument::fromJson(geoData);
+        QJsonObject obj = doc.object();
+        QJsonArray results = obj["results"].toArray();
 
         if (!results.isEmpty()) {
             QJsonObject location = results[0].toObject();
             double lat = location["latitude"].toDouble();
             double lon = location["longitude"].toDouble();
+
+            qDebug() << "Got forecast coordinates:" << lat << lon;
 
             QUrl url(WEATHER_API_URL);
             QUrlQuery query;
@@ -276,6 +333,8 @@ void MainWindow::fetchForecast(const QString &city)
 
             QNetworkRequest forecastRequest = createRequest(url);
             m_networkManager->get(forecastRequest);
+        } else {
+            qDebug() << "No forecast geocoding results found";
         }
     });
 }
@@ -285,6 +344,7 @@ void MainWindow::onForecastFinished(QNetworkReply *reply)
     reply->deleteLater();
 
     if (reply->error() != QNetworkReply::NoError) {
+        qDebug() << "Forecast error:" << reply->errorString();
         return;
     }
 
@@ -305,15 +365,13 @@ void MainWindow::onForecastFinished(QNetworkReply *reply)
         fd.tempMin = tempMin[i].toDouble();
 
         int code = weatherCodes[i].toInt();
-        if (code == 0) fd.description = "Ясно";
-        else if (code <= 3) fd.description = "Облачно";
-        else if (code <= 67) fd.description = "Дождь";
-        else if (code <= 77) fd.description = "Снег";
-        else fd.description = "Гроза";
+        fd.weatherCode = code;
+        fd.description = getWeatherDescription(code);
 
         forecast.append(fd);
     }
 
+    m_currentForecastData = forecast;
     displayForecast(forecast);
 }
 
@@ -322,16 +380,16 @@ void MainWindow::displayWeather(const WeatherData &data)
     ui->m_cityLabel->setText(data.city);
     ui->m_tempLabel->setText(QString::number(convertTemp(data.temp), 'f', 1) + getTempUnit());
     ui->m_descLabel->setText(data.description);
-    ui->m_feelsLikeLabel->setText("Ощущается: " + QString::number(convertTemp(data.feelsLike), 'f', 1) + getTempUnit());
-    ui->m_humidityLabel->setText("💧 Влажность: " + QString::number(data.humidity) + "%");
-    ui->m_windLabel->setText("💨 Ветер: " + QString::number(convertSpeed(data.windSpeed), 'f', 1) + " " + getSpeedUnit());
 
-    QString icon = "☀️";
-    if (data.description.contains("Облачно")) icon = "☁️";
-    else if (data.description.contains("Дождь")) icon = "🌧️";
-    else if (data.description.contains("Снег")) icon = "❄️";
-    else if (data.description.contains("Гроза")) icon = "⛈️";
+    ui->m_feelsLikeLabel->setText(TR("Weather/feels_like") +
+                                  QString::number(convertTemp(data.feelsLike), 'f', 1) + getTempUnit());
 
+    ui->m_humidityLabel->setText("💧 " + TR("Weather/humidity") + QString::number(data.humidity) + "%");
+
+    ui->m_windLabel->setText("💨 " + TR("Weather/wind") +
+                            QString::number(convertSpeed(data.windSpeed), 'f', 1) + " " + getSpeedUnit());
+
+    QString icon = getWeatherIcon(data.description);
     ui->m_iconLabel->setText(icon);
 }
 
@@ -358,11 +416,7 @@ void MainWindow::displayForecast(const QList<ForecastData> &forecast)
         dateFont.setPointSize(12);
         dateLabel->setFont(dateFont);
 
-        QString icon = "☀️";
-        if (fd.description.contains("Облачно")) icon = "☁️";
-        else if (fd.description.contains("Дождь")) icon = "🌧️";
-        else if (fd.description.contains("Снег")) icon = "❄️";
-        else if (fd.description.contains("Гроза")) icon = "⛈️";
+        QString icon = getWeatherIcon(fd.description);
 
         QLabel *iconLabel = new QLabel(icon);
         QFont iconFont = iconLabel->font();
@@ -398,12 +452,12 @@ void MainWindow::displayForecast(const QList<ForecastData> &forecast)
 void MainWindow::addToFavorites()
 {
     if (m_currentCity.isEmpty()) {
-        QMessageBox::warning(this, "Ошибка", "Сначала выберите город");
+        QMessageBox::warning(this, TR("Favorites/info_title"), TR("Favorites/select_first"));
         return;
     }
 
     if (m_favoriteCities.contains(m_currentCity)) {
-        QMessageBox::information(this, "Информация", "Город уже в избранном");
+        QMessageBox::information(this, TR("Favorites/info_title"), TR("Favorites/already_added"));
         return;
     }
 
@@ -429,11 +483,53 @@ void MainWindow::loadFavoriteCity(const QString &city)
     fetchForecast(city);
 }
 
-void MainWindow::toggleTheme()
+void MainWindow::toggleLanguage()
 {
-    m_isDarkTheme = !m_isDarkTheme;
-    applyTheme();
+    // Переключаем между ru и en
+    m_currentLanguage = (m_currentLanguage == "ru") ? "en" : "ru";
+
+    // Загружаем новый язык
+    Translator::instance().loadLanguage(m_currentLanguage);
+
+    updateLanguage();
+
+    // Перерисовываем данные с новым языком если они есть
+    if (m_hasWeatherData) {
+        // Обновляем описания погоды на основе сохраненных кодов
+        m_currentWeatherData.description = getWeatherDescription(m_currentWeatherData.weatherCode);
+        displayWeather(m_currentWeatherData);
+
+        // Обновляем описания прогноза
+        for (int i = 0; i < m_currentForecastData.size(); ++i) {
+            m_currentForecastData[i].description = getWeatherDescription(m_currentForecastData[i].weatherCode);
+        }
+        displayForecast(m_currentForecastData);
+    }
+
     saveSettings();
+}
+
+void MainWindow::updateLanguage()
+{
+    // Обновляем кнопку языка
+    ui->m_languageButton->setText(m_currentLanguage.toUpper());
+
+    // Обновляем все текстовые элементы интерфейса
+    setWindowTitle(TR("General/app_title"));
+    ui->m_searchInput->setPlaceholderText(TR("Search/placeholder"));
+    ui->m_searchButton->setText(TR("Search/button"));
+    ui->m_favoriteButton->setToolTip(TR("Favorites/add_tooltip"));
+    ui->m_refreshButton->setToolTip(TR("Controls/refresh_tooltip"));
+    ui->m_languageButton->setToolTip(TR("Controls/language_tooltip"));
+    ui->m_unitsCombo->setItemText(0, "°C, " + TR("Weather/speed_ms"));
+    ui->m_unitsCombo->setItemText(1, "°F, " + TR("Weather/speed_mph"));
+    ui->forecastTitle->setText("📅 " + TR("Forecast/title"));
+    ui->favoritesTitle->setText("⭐ " + TR("Favorites/title"));
+    ui->removeFavButton->setText(TR("Favorites/remove_button"));
+
+    if (m_currentCity.isEmpty()) {
+        ui->m_cityLabel->setText(TR("General/select_city"));
+    }
 }
 
 void MainWindow::toggleUnits()
@@ -470,7 +566,7 @@ void MainWindow::performSearchSuggestions(const QString &text)
     QUrlQuery query;
     query.addQueryItem("name", text);
     query.addQueryItem("count", "10");
-    query.addQueryItem("language", "ru");
+    query.addQueryItem("language", getCurrentLanguageCode());
     url.setQuery(query);
 
     QNetworkRequest request = createRequest(url);
@@ -499,305 +595,157 @@ void MainWindow::onSuggestionsFinished(QNetworkReply *reply)
 
 void MainWindow::applyTheme()
 {
-    QString theme;
-
-    if (m_isDarkTheme) {
-        ui->m_themeButton->setText("☀️");
-        theme = R"(
-            QMainWindow {
-                background-color: #0d0d0d;
-            }
-            QWidget {
-                background-color: #0d0d0d;
-                color: #ffffff;
-            }
-            QWidget#centralWidget {
-                background-color: #0d0d0d;
-            }
-            QLabel {
-                color: #ffffff;
-                background-color: transparent;
-            }
-            QFrame {
-                background-color: #1a1a1a;
-                color: #ffffff;
-                border: 1px solid #2d2d2d;
-                border-radius: 8px;
-            }
-            QFrame#weatherFrame, QFrame#favoritesFrame {
-                background-color: #1a1a1a;
-                border: 1px solid #2d2d2d;
-            }
-            QLineEdit {
-                background-color: #2d2d2d;
-                color: #ffffff;
-                border: 1px solid #404040;
-                border-radius: 4px;
-                padding: 5px;
-                selection-background-color: #0d7377;
-            }
-            QLineEdit:focus {
-                border: 1px solid #0d7377;
-            }
-            QComboBox {
-                background-color: #2d2d2d;
-                color: #ffffff;
-                border: 1px solid #404040;
-                border-radius: 4px;
-                padding: 5px;
-            }
-            QComboBox:hover {
-                border: 1px solid #0d7377;
-            }
-            QComboBox::drop-down {
-                border: none;
-                width: 20px;
-            }
-            QComboBox QAbstractItemView {
-                background-color: #2d2d2d;
-                color: #ffffff;
-                selection-background-color: #0d7377;
-                border: 1px solid #404040;
-            }
-            QPushButton {
-                background-color: #0d7377;
-                color: #ffffff;
-                border: none;
-                border-radius: 4px;
-                padding: 8px 16px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #14a085;
-            }
-            QPushButton:pressed {
-                background-color: #0a5a5d;
-            }
-            QListWidget {
-                background-color: #1a1a1a;
-                color: #ffffff;
-                border: 1px solid #2d2d2d;
-                border-radius: 4px;
-                outline: none;
-            }
-            QListWidget::item {
-                color: #ffffff;
-                padding: 8px;
-                border-bottom: 1px solid #2d2d2d;
-            }
-            QListWidget::item:selected {
-                background-color: #0d7377;
-                color: #ffffff;
-            }
-            QListWidget::item:hover {
-                background-color: #2d2d2d;
-            }
-            QScrollArea {
-                background-color: #0d0d0d;
-                border: none;
-            }
-            QScrollArea > QWidget > QWidget {
-                background-color: #0d0d0d;
-            }
-            QScrollBar:vertical {
-                background-color: #1a1a1a;
-                width: 12px;
-                border: none;
-            }
-            QScrollBar::handle:vertical {
-                background-color: #404040;
-                border-radius: 6px;
-                min-height: 20px;
-            }
-            QScrollBar::handle:vertical:hover {
-                background-color: #505050;
-            }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-                height: 0px;
-            }
-            QScrollBar:horizontal {
-                background-color: #1a1a1a;
-                height: 12px;
-                border: none;
-            }
-            QScrollBar::handle:horizontal {
-                background-color: #404040;
-                border-radius: 6px;
-                min-width: 20px;
-            }
-            QScrollBar::handle:horizontal:hover {
-                background-color: #505050;
-            }
-            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
-                width: 0px;
-            }
-            QMenuBar {
-                background-color: #1a1a1a;
-                color: #ffffff;
-                border-bottom: 1px solid #2d2d2d;
-            }
-            QMenuBar::item {
-                background-color: transparent;
-                padding: 4px 8px;
-            }
-            QMenuBar::item:selected {
-                background-color: #2d2d2d;
-            }
-            QToolBar {
-                background-color: #1a1a1a;
-                border: none;
-                spacing: 3px;
-            }
-            QStatusBar {
-                background-color: #1a1a1a;
-                color: #ffffff;
-                border-top: 1px solid #2d2d2d;
-            }
-        )";
-    } else {
-        ui->m_themeButton->setText("🌙");
-        theme = R"(
-            QMainWindow {
-                background-color: #f5f5f5;
-            }
-            QWidget {
-                background-color: #f5f5f5;
-                color: #333333;
-            }
-            QLabel {
-                color: #333333;
-                background-color: transparent;
-            }
-            QFrame {
-                background-color: #ffffff;
-                color: #333333;
-                border: 1px solid #e0e0e0;
-                border-radius: 8px;
-            }
-            QLineEdit {
-                background-color: #ffffff;
-                color: #333333;
-                border: 1px solid #cccccc;
-                border-radius: 4px;
-                padding: 5px;
-                selection-background-color: #2196F3;
-            }
-            QLineEdit:focus {
-                border: 1px solid #2196F3;
-            }
-            QComboBox {
-                background-color: #ffffff;
-                color: #333333;
-                border: 1px solid #cccccc;
-                border-radius: 4px;
-                padding: 5px;
-            }
-            QComboBox:hover {
-                border: 1px solid #2196F3;
-            }
-            QComboBox::drop-down {
-                border: none;
-                width: 20px;
-            }
-            QComboBox QAbstractItemView {
-                background-color: #ffffff;
-                color: #333333;
-                selection-background-color: #2196F3;
-                border: 1px solid #cccccc;
-            }
-            QPushButton {
-                background-color: #2196F3;
-                color: #ffffff;
-                border: none;
-                border-radius: 4px;
-                padding: 8px 16px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #1976D2;
-            }
-            QPushButton:pressed {
-                background-color: #0D47A1;
-            }
-            QListWidget {
-                background-color: #ffffff;
-                color: #333333;
-                border: 1px solid #e0e0e0;
-                border-radius: 4px;
-                outline: none;
-            }
-            QListWidget::item {
-                color: #333333;
-                padding: 8px;
-                border-bottom: 1px solid #f0f0f0;
-            }
-            QListWidget::item:selected {
-                background-color: #2196F3;
-                color: #ffffff;
-            }
-            QListWidget::item:hover {
-                background-color: #f5f5f5;
-            }
-            QScrollArea {
-                background-color: #f5f5f5;
-                border: none;
-            }
-            QScrollBar:vertical {
-                background-color: #f0f0f0;
-                width: 12px;
-                border: none;
-            }
-            QScrollBar::handle:vertical {
-                background-color: #c0c0c0;
-                border-radius: 6px;
-                min-height: 20px;
-            }
-            QScrollBar::handle:vertical:hover {
-                background-color: #a0a0a0;
-            }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-                height: 0px;
-            }
-            QScrollBar:horizontal {
-                background-color: #f0f0f0;
-                height: 12px;
-                border: none;
-            }
-            QScrollBar::handle:horizontal {
-                background-color: #c0c0c0;
-                border-radius: 6px;
-                min-width: 20px;
-            }
-            QScrollBar::handle:horizontal:hover {
-                background-color: #a0a0a0;
-            }
-            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
-                width: 0px;
-            }
-            QMenuBar {
-                background-color: #ffffff;
-                color: #333333;
-                border-bottom: 1px solid #e0e0e0;
-            }
-            QMenuBar::item {
-                background-color: transparent;
-                padding: 4px 8px;
-            }
-            QMenuBar::item:selected {
-                background-color: #f0f0f0;
-            }
-            QToolBar {
-                background-color: #ffffff;
-                border: none;
-                spacing: 3px;
-            }
-            QStatusBar {
-                background-color: #ffffff;
-                color: #333333;
-                border-top: 1px solid #e0e0e0;
-            }
-        )";
-    }
+    QString theme = R"(
+        QMainWindow {
+            background-color: #0d0d0d;
+        }
+        QWidget {
+            background-color: #0d0d0d;
+            color: #ffffff;
+        }
+        QWidget#centralWidget {
+            background-color: #0d0d0d;
+        }
+        QLabel {
+            color: #ffffff;
+            background-color: transparent;
+        }
+        QFrame {
+            background-color: #1a1a1a;
+            color: #ffffff;
+            border: 1px solid #2d2d2d;
+            border-radius: 8px;
+        }
+        QFrame#weatherFrame, QFrame#favoritesFrame {
+            background-color: #1a1a1a;
+            border: 1px solid #2d2d2d;
+        }
+        QLineEdit {
+            background-color: #2d2d2d;
+            color: #ffffff;
+            border: 1px solid #404040;
+            border-radius: 4px;
+            padding: 5px;
+            selection-background-color: #0d7377;
+        }
+        QLineEdit:focus {
+            border: 1px solid #0d7377;
+        }
+        QComboBox {
+            background-color: #2d2d2d;
+            color: #ffffff;
+            border: 1px solid #404040;
+            border-radius: 4px;
+            padding: 5px;
+        }
+        QComboBox:hover {
+            border: 1px solid #0d7377;
+        }
+        QComboBox::drop-down {
+            border: none;
+            width: 20px;
+        }
+        QComboBox QAbstractItemView {
+            background-color: #2d2d2d;
+            color: #ffffff;
+            selection-background-color: #0d7377;
+            border: 1px solid #404040;
+        }
+        QPushButton {
+            background-color: #0d7377;
+            color: #ffffff;
+            border: none;
+            border-radius: 4px;
+            padding: 8px 16px;
+            font-weight: bold;
+        }
+        QPushButton:hover {
+            background-color: #14a085;
+        }
+        QPushButton:pressed {
+            background-color: #0a5a5d;
+        }
+        QListWidget {
+            background-color: #1a1a1a;
+            color: #ffffff;
+            border: 1px solid #2d2d2d;
+            border-radius: 4px;
+            outline: none;
+        }
+        QListWidget::item {
+            color: #ffffff;
+            padding: 8px;
+            border-bottom: 1px solid #2d2d2d;
+        }
+        QListWidget::item:selected {
+            background-color: #0d7377;
+            color: #ffffff;
+        }
+        QListWidget::item:hover {
+            background-color: #2d2d2d;
+        }
+        QScrollArea {
+            background-color: #0d0d0d;
+            border: none;
+        }
+        QScrollArea > QWidget > QWidget {
+            background-color: #0d0d0d;
+        }
+        QScrollBar:vertical {
+            background-color: #1a1a1a;
+            width: 12px;
+            border: none;
+        }
+        QScrollBar::handle:vertical {
+            background-color: #404040;
+            border-radius: 6px;
+            min-height: 20px;
+        }
+        QScrollBar::handle:vertical:hover {
+            background-color: #505050;
+        }
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+            height: 0px;
+        }
+        QScrollBar:horizontal {
+            background-color: #1a1a1a;
+            height: 12px;
+            border: none;
+        }
+        QScrollBar::handle:horizontal {
+            background-color: #404040;
+            border-radius: 6px;
+            min-width: 20px;
+        }
+        QScrollBar::handle:horizontal:hover {
+            background-color: #505050;
+        }
+        QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+            width: 0px;
+        }
+        QMenuBar {
+            background-color: #1a1a1a;
+            color: #ffffff;
+            border-bottom: 1px solid #2d2d2d;
+        }
+        QMenuBar::item {
+            background-color: transparent;
+            padding: 4px 8px;
+        }
+        QMenuBar::item:selected {
+            background-color: #2d2d2d;
+        }
+        QToolBar {
+            background-color: #1a1a1a;
+            border: none;
+            spacing: 3px;
+        }
+        QStatusBar {
+            background-color: #1a1a1a;
+            color: #ffffff;
+            border-top: 1px solid #2d2d2d;
+        }
+    )";
 
     setStyleSheet(theme);
 }
@@ -812,8 +760,13 @@ void MainWindow::loadSettings()
 {
     m_favoriteCities = m_settings->value("favorites").toStringList();
     m_currentCity = m_settings->value("lastCity").toString();
-    m_isDarkTheme = m_settings->value("darkTheme", false).toBool();
+    // m_currentLanguage уже загружен в конструкторе
     m_isCelsius = m_settings->value("celsius", true).toBool();
+
+    qDebug() << "Settings loaded:";
+    qDebug() << "  Favorites count:" << m_favoriteCities.size();
+    qDebug() << "  Last city:" << m_currentCity;
+    qDebug() << "  Celsius:" << m_isCelsius;
 
     updateFavoritesList();
     ui->m_unitsCombo->setCurrentIndex(m_isCelsius ? 0 : 1);
@@ -823,7 +776,7 @@ void MainWindow::saveSettings()
 {
     m_settings->setValue("favorites", m_favoriteCities);
     m_settings->setValue("lastCity", m_currentCity);
-    m_settings->setValue("darkTheme", m_isDarkTheme);
+    m_settings->setValue("language", m_currentLanguage);
     m_settings->setValue("celsius", m_isCelsius);
 }
 
@@ -844,20 +797,39 @@ QString MainWindow::getTempUnit()
 
 QString MainWindow::getSpeedUnit()
 {
-    return m_isCelsius ? "м/с" : "миль/ч";
+    return m_isCelsius ? TR("Weather/speed_ms") : TR("Weather/speed_mph");
+}
+
+QString MainWindow::getWeatherDescription(int code)
+{
+    if (code == 0) return TR("WeatherConditions/clear");
+    else if (code <= 3) return TR("WeatherConditions/cloudy");
+    else if (code <= 67) return TR("WeatherConditions/rain");
+    else if (code <= 77) return TR("WeatherConditions/snow");
+    else return TR("WeatherConditions/thunderstorm");
+}
+
+QString MainWindow::getWeatherIcon(const QString &description)
+{
+    QString clear = TR("WeatherConditions/clear");
+    QString cloudy = TR("WeatherConditions/cloudy");
+    QString rain = TR("WeatherConditions/rain");
+    QString snow = TR("WeatherConditions/snow");
+    QString thunderstorm = TR("WeatherConditions/thunderstorm");
+
+    if (description == cloudy) return "☁️";
+    else if (description == rain) return "🌧️";
+    else if (description == snow) return "❄️";
+    else if (description == thunderstorm) return "⛈️";
+    else return "☀️";
+}
+
+QString MainWindow::getCurrentLanguageCode() const
+{
+    return m_currentLanguage;
 }
 
 QString MainWindow::getWeatherIconUrl(const QString &icon)
 {
     return "https://openweathermap.org/img/wn/" + icon + "@2x.png";
-}
-
-void MainWindow::downloadWeatherIcon(const QString &iconCode)
-{
-    // Заглушка
-}
-
-void MainWindow::onIconDownloaded(QNetworkReply *reply)
-{
-    // Заглушка
 }

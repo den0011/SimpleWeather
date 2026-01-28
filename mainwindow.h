@@ -26,6 +26,7 @@ struct WeatherData {
     QString description;
     QString icon;
     QDateTime dateTime;
+    int weatherCode;
 };
 
 struct ForecastData {
@@ -35,6 +36,7 @@ struct ForecastData {
     double tempMax;
     QString description;
     QString icon;
+    int weatherCode;
 };
 
 class MainWindow : public QMainWindow
@@ -54,7 +56,7 @@ private slots:
     void addToFavorites();
     void removeFromFavorites();
     void loadFavoriteCity(const QString &city);
-    void toggleTheme();
+    void toggleLanguage();
     void toggleUnits();
     void refreshCurrentCity();
     void updateSearchSuggestions(const QString &text);
@@ -70,15 +72,17 @@ private:
     void displayWeather(const WeatherData &data);
     void displayForecast(const QList<ForecastData> &forecast);
     void applyTheme();
+    void updateLanguage();
     void updateFavoritesList();
     QString getWeatherIconUrl(const QString &icon);
-    void downloadWeatherIcon(const QString &iconCode);
-    void onIconDownloaded(QNetworkReply *reply);
     double convertTemp(double temp);
     double convertSpeed(double speed);
     QString getTempUnit();
     QString getSpeedUnit();
     QNetworkRequest createRequest(const QUrl &url);
+    QString getWeatherDescription(int code);
+    QString getWeatherIcon(const QString &description);
+    QString getCurrentLanguageCode() const;
 
     Ui::MainWindow *ui;
     QNetworkAccessManager *m_networkManager;
@@ -89,12 +93,17 @@ private:
     // Данные
     QString m_currentCity;
     QStringList m_favoriteCities;
-    bool m_isDarkTheme;
+    QString m_currentLanguage;  // Теперь храним код языка вместо bool
     bool m_isCelsius;
     QMap<QString, QPixmap> m_iconCache;
     QCompleter *m_completer;
     QStringListModel *m_completerModel;
     QSet<QNetworkReply*> m_searchReplies;
+
+    // Сохраненные данные погоды для перерисовки
+    WeatherData m_currentWeatherData;
+    QList<ForecastData> m_currentForecastData;
+    bool m_hasWeatherData;
 
     // Константы
     const QString WEATHER_API_URL = "http://api.open-meteo.com/v1/forecast";

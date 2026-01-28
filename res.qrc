@@ -1,0 +1,12 @@
+<RCC>
+    <qresource prefix="/">
+        <file>res/delete.png</file>
+        <file>res/favorite.png</file>
+        <file>res/favorites.png</file>
+        <file>res/glass.png</file>
+        <file>res/humidity.png</file>
+        <file>res/weather.png</file>
+        <file>res/wind.png</file>
+        <file>res/refresh.png</file>
+    </qresource>
+</RCC>

@@ -12,11 +12,18 @@ CONFIG += c++11
 
 SOURCES += \
         main.cpp \
-        mainwindow.cpp
+        mainwindow.cpp \
+        translator.cpp
 
 HEADERS += \
-        mainwindow.h
+        mainwindow.h \
+        translator.h
 
 FORMS += \
         mainwindow.ui
 
+RESOURCES += \
+    res.qrc
+
+RC_FILE += res/file.rc
+OTHER_FILES += res/file.rc
